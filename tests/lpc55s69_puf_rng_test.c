@@ -49,6 +49,7 @@
 #define PUF_CTRL_SETKEY      0x10u
 #define PUF_CTRL_GETKEY      0x40u
 #define PUF_CTRL_ZEROIZE     0x1u
+#define PUF_ALLOW_START      0x2u
 
 #define PUF_STAT_BUSY         0x1u
 #define PUF_STAT_SUCCESS      0x2u
@@ -578,11 +579,16 @@ static int test_puf_zeroize(void)
 {
     struct mm_memmap map;
     struct mmio_region regions[64];
+    mm_u8 ac[PUF_AC_WORDS * 4u];
     mm_u32 value;
+    int rc;
 
     test_init_map(&map, regions, 64u);
     if (puf_power_on(&map) != 0)
         return 1;
+    rc = puf_enroll(&map, ac);
+    if (rc != 0)
+        return 100 + rc;
     if (wr(&map, PUF_BASE + PUF_OFF_CTRL, PUF_CTRL_ZEROIZE) != 0)
         return 2;
     if (rd(&map, PUF_BASE + PUF_OFF_STAT, &value) != 0)
@@ -591,10 +597,10 @@ static int test_puf_zeroize(void)
         return 4;
     if (rd(&map, PUF_BASE + PUF_OFF_ALLOW, &value) != 0)
         return 5;
-    if (value != 0u)
+    if (value != PUF_ALLOW_START)
         return 6;
 
-    /* zeroize is permanent: survives a full machine reset */
+    /* Zeroized state survives reset; only START with the saved AC restores it. */
     test_reboot(&map);
     if (puf_power_on(&map) != 0)
         return 7;
@@ -604,8 +610,21 @@ static int test_puf_zeroize(void)
         return 9;
     if (rd(&map, PUF_BASE + PUF_OFF_ALLOW, &value) != 0)
         return 10;
-    if (value != 0u)
+    if (value != PUF_ALLOW_START)
         return 11;
+    if (wr(&map, PUF_BASE + PUF_OFF_CTRL, PUF_CTRL_ENROLL) != 0)
+        return 12;
+    if (rd(&map, PUF_BASE + PUF_OFF_STAT, &value) != 0)
+        return 13;
+    if ((value & PUF_STAT_ERROR) == 0u)
+        return 14;
+    rc = puf_start(&map, ac);
+    if (rc != 0)
+        return 200 + rc;
+    if (rd(&map, PUF_BASE + PUF_OFF_ALLOW, &value) != 0)
+        return 15;
+    if (value != 0xFu)
+        return 16;
     return 0;
 }
 
