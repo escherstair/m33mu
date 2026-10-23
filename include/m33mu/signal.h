@@ -64,7 +64,7 @@ void mm_signal_advance(mm_u64 cycles);
  * Idle fast-forwarding must not skip past it. */
 mm_u64 mm_signal_cycles_until_next_event(void);
 
-/* bank: 0=A, 1=B, ...; returns the binding id or -1. */
+/* bank: 0=A, 1=B, ...; returns the binding id, or -1 (also for a pin already bound). */
 int mm_signal_bind(const char *trace_name, int bank, int pin,
                     enum mm_signal_role role);
 
@@ -77,5 +77,9 @@ mm_bool mm_signal_triggered(void);
 mm_u64 mm_signal_now_ns(void);
 /* MM_FALSE until the trigger has fired. */
 mm_bool mm_signal_trigger_ns(mm_u64 *ns_out);
+
+/* Pad voltage of the trace bound to the pin, cycles_ahead cycles after the replay
+ * clock; sample 0 before the trigger. MM_FALSE and *mv_out = 0 if the pin is unbound. */
+mm_bool mm_signal_sample_mv(int bank, int pin, mm_u64 cycles_ahead, mm_i32 *mv_out);
 
 #endif /* M33MU_SIGNAL_H */

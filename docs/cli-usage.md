@@ -150,7 +150,7 @@ Replay recorded voltage traces onto GPIO inputs. See
 
 - `--signal-file=<path>`: load a `.sigc` signal container
 - `--signal-bind:trace=<name>:target=<PXn>[:role=gpio]`: drive input pin `PXn` from a trace.
-  `role=` defaults to `gpio`, the only role supported
+  `role=` defaults to `gpio`, the only role supported. Each pin can be bound once
 - `--signal-sync=<symbol|addr>`: start replay when the PC first reaches this address
   (a symbol requires an ELF image). Required with `--signal-bind`, optional with
   `--signal-record`; the run exits with 1 if the address is never reached
