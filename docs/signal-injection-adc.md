@@ -23,7 +23,7 @@ or taking an error path.
 | # | Topic | Decision | Rationale |
 |---|---|---|---|
 | 1 | First target | **STM32H5F4** (RM0517). H563/H533 (RM0481) follow on the same `cpu/stm32_adc.c`, with per-SoC glue for base addresses, IRQ numbers and the channel table | H5F4 is what the production firmware runs on. The ADC IP is the same across the H5 family |
-| 2 | Instances | Map **all three ADCs**, all with the full model. ADC1 (master) and ADC2 (slave) share one block at 0x4202 8000: ADC1 at +0x000, ADC2 at +0x100, common registers at +0x300. ADC3 is independent, at 0x4202 D800 with the same layout and its own common registers. The secure aliases are at 0x5202 xxxx. IRQs: ADC1 37, ADC2 69, ADC3 149. Dual mode (`CCR.DUAL`) is stored but not modelled | HAL reads the other instance's `CR` when it decides whether it may write `CCR`. An unmapped instance faults |
+| 2 | Instances | **ADC1/2 first**, which is what the production firmware uses; ADC3 follows on the same model (§6). All instances get the full model. ADC1 (master) and ADC2 (slave) share one block at 0x4202 8000: ADC1 at +0x000, ADC2 at +0x100, common registers at +0x300. ADC3 is independent, at 0x4202 D800 with the same layout and its own common registers. The secure aliases are at 0x5202 xxxx. IRQs: ADC1 37, ADC2 69, ADC3 149. Dual mode (`CCR.DUAL`) is stored but not modelled | HAL reads the other instance's `CR` when it decides whether it may write `CCR`. An unmapped instance faults |
 | 3 | Conversion modes | **Software start, polled**, then **EOC/EOS interrupts**, then **continuous mode** (`CFGR.CONT`). **Continuous + DMA is a separate PR** | These cover the production firmware. DMA needs GPDMA peripheral requests (`REQSEL`, one beat per request, circular mode), which `cpu/stm32_gpdma.c` lacks today |
 | 4 | Channels | **Regular scan sequence**: `SQR1.L` + 1 conversions, channels from `SQR1..SQR4`. The injected group is out of scope: `JADSTART` writes are ignored | The production firmware scans several channels |
 | 5 | Calibration and ready | **Fixed delays** from DS14972 Table 97: `ADCAL` clears after t_OFF_CAL = **1335 ADC clocks**. `ADRDY` sets t_STAB after `ADEN`; the datasheet gives a minimum of 1 conversion cycle, modelled as **15 ADC clocks** (one 12-bit conversion at the minimum sampling time). The full `CR` state machine is in §2.2 | HAL polls both flags with timeouts. Fixed delays keep start-up timing realistic |
@@ -155,10 +155,11 @@ check that.
 
 1. `mm_signal_sample_mv` and the duplicate-pin check in `src/signal.c`, with unit tests.
 2. `cpu/stm32_adc.c/.h`: storage, the `CR` state machine, calibration/ready delays, single software conversion, polled, peek. `tests/stm32_adc_test.c`.
-3. H5F4 glue: instances, base addresses, IRQ numbers and channel table from RM0517 and the datasheet; MMIO registration; clock gating; tick call; idle-bound callback.
+3. H5F4 glue for ADC1/2: base addresses, IRQ numbers and channel table from RM0517 and the datasheet; MMIO registration; clock gating; tick call; idle-bound callback.
 4. CLI: `--adc-vref-mv`, `--adc-noise-lsb`, `--adc-seed`; `docs/cli-usage.md`, `m33mu.1`.
 5. Scan sequence, `EOC`/`EOS`/`OVR` interrupts, continuous mode, offset and alignment.
-6. H563/H533 glue.
+6. ADC3 on H5F4.
+7. H563/H533 glue.
 
 ## 7. Testing
 
