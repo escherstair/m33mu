@@ -1,8 +1,8 @@
 # m33mu — External Signal Injection Design: ADC
 
 Status: **design agreed, not implemented.** Register-level facts are checked
-against RM0517 Rev 1. Values marked *(confirm)* need the STM32H5F4 datasheet;
-§9 lists them.
+against RM0517 Rev 1, and timing and pin values against the STM32H5Fxxx
+datasheet DS14972 Rev 1.
 Depends on: [signal-injection-gpio.md](signal-injection-gpio.md). This phase
 reuses the `.sigc` container, `--signal-bind`, `--signal-sync` and the replay
 clock of `src/signal.c` without changing their shape. Read that doc first; this
@@ -26,13 +26,13 @@ or taking an error path.
 | 2 | Instances | Map **all three ADCs**, all with the full model. ADC1 (master) and ADC2 (slave) share one block at 0x4202 8000: ADC1 at +0x000, ADC2 at +0x100, common registers at +0x300. ADC3 is independent, at 0x4202 D800 with the same layout and its own common registers. The secure aliases are at 0x5202 xxxx. IRQs: ADC1 37, ADC2 69, ADC3 149. Dual mode (`CCR.DUAL`) is stored but not modelled | HAL reads the other instance's `CR` when it decides whether it may write `CCR`. An unmapped instance faults |
 | 3 | Conversion modes | **Software start, polled**, then **EOC/EOS interrupts**, then **continuous mode** (`CFGR.CONT`). **Continuous + DMA is a separate PR** | These cover the production firmware. DMA needs GPDMA peripheral requests (`REQSEL`, one beat per request, circular mode), which `cpu/stm32_gpdma.c` lacks today |
 | 4 | Channels | **Regular scan sequence**: `SQR1.L` + 1 conversions, channels from `SQR1..SQR4`. The injected group is out of scope: `JADSTART` writes are ignored | The production firmware scans several channels |
-| 5 | Calibration and ready | **Fixed delays**: `ADCAL` clears after t_CAL, and `ADRDY` sets t_STAB after `ADEN` *(confirm both)*. The full `CR` state machine is in §2.2 | HAL polls both flags with timeouts. Fixed delays keep start-up timing realistic |
-| 6 | ADC clock | **HCLK synchronous only**: `ADC_CCR.CKMODE` = 01/10/11 → HCLK/1, /2, /4. `CKMODE = 00` prints a one-time "unsupported" warning and runs as HCLK/1. A one-time warning also fires when f_ADC exceeds the datasheet maximum *(confirm)*. `RCC_CCIPR5.ADCDACSEL`, `CCR.PRESC` and the HPRE = 1 requirement of HCLK/1 (RM0517 §30.4.3) are not modelled | The production firmware uses the synchronous clock, which gives an exact integer ratio to CPU cycles |
+| 5 | Calibration and ready | **Fixed delays** from DS14972 Table 97: `ADCAL` clears after t_OFF_CAL = **1335 ADC clocks**. `ADRDY` sets t_STAB after `ADEN`; the datasheet gives a minimum of 1 conversion cycle, modelled as **15 ADC clocks** (one 12-bit conversion at the minimum sampling time). The full `CR` state machine is in §2.2 | HAL polls both flags with timeouts. Fixed delays keep start-up timing realistic |
+| 6 | ADC clock | **HCLK synchronous only**: `ADC_CCR.CKMODE` = 01/10/11 → HCLK/1, /2, /4. `CKMODE = 00` prints a one-time "unsupported" warning and runs as HCLK/1. A one-time warning also fires when f_ADC falls outside 1.5–75 MHz (DS14972 Table 97). `RCC_CCIPR5.ADCDACSEL`, `CCR.PRESC` and the HPRE = 1 requirement of HCLK/1 (RM0517 §30.4.3) are not modelled | The production firmware uses the synchronous clock, which gives an exact integer ratio to CPU cycles |
 | 7 | Conversion timing | **Sampled at the end of the sampling time**, when `EOSMP` sets. `EOC` follows after the resolution time. §3 has the arithmetic | Matches silicon. With long sampling times, sampling at slot start would be about 10 µs early |
 | 8 | Quantizer | `code = clamp(round(mV · (2^res − 1) / vref_mv), 0, 2^res − 1)`, then the offset stage and alignment of §2.5. Out-of-range input **saturates**, it never wraps | Ideal by default, so tests assert exact codes |
 | 9 | Noise | Off by default. **`--adc-noise-lsb=<n>`** adds uniform ±n LSB before the clamp, from a PRNG seeded by **`--adc-seed=<s>`** (default 0). No offset or gain error model | Robustness tests that stay reproducible |
 | 10 | Reference voltage | **`--adc-vref-mv`**, defaulting to `--vdd-mv` | On H5, full scale is `VREF+`, which may differ from `VDD` |
-| 11 | Binding | **By pin**: `--signal-bind:trace=ain0:target=PA0`, with no new role. The per-SoC table maps **(instance, channel) → pin**, because some channel numbers sit on different pins on ADC1 and ADC2. Binding **two traces to the same pin is rejected** | Firmware and schematics name pins. One pad voltage feeds both the digital input and the ADC |
+| 11 | Binding | **By pin**: `--signal-bind:trace=ain0:target=PA0`, with no new role. The per-SoC table maps **(instance, channel) → pin**, because some channel numbers sit on different pins on ADC1 and ADC2 (§5.1). Binding **two traces to the same pin is rejected**. Only single-ended inputs are modelled: a channel with its `DIFSEL` bit set prints a one-time warning and converts as single-ended | Firmware and schematics name pins. One pad voltage feeds both the digital input and the ADC |
 | 12 | Pin mode | The ADC sees the injected voltage only when the pin's `MODER` is analog (`11`). A channel with no pin in the table, an unbound pin, or a pin not in analog mode converts as 0 mV. An analog pin reads 0 in `IDR`, as on silicon | Matches the hardware, and catches firmware that forgets analog mode |
 | 13 | Sampling API | `mm_signal_sample_mv(bank, pin, cycles_ahead, &mv)`; §4 | The ADC pulls one value per conversion. GPIO keeps its precomputed crossings |
 | 14 | `full_scale_mv` | **Metadata only.** The emulator never reads it | It records the capture's range, not the emulated ADC's |
@@ -130,6 +130,27 @@ mm_bool mm_signal_sample_mv(int bank, int pin, mm_u64 cycles_ahead, mm_i32 *mv_o
 - **Fast path when idle:** the ADC caches its next deadline. The tick costs one comparison while nothing is converting.
 - **Binding:** `--signal-bind` stays as it is. ADC glue looks up the bound pin through the channel table at conversion time. The duplicate-pin check goes into `mm_signal_bind`.
 
+### 5.1 H5F4 channel table
+
+From the pinout table of DS14972 (positive inputs only). `ADC12_INPn` is
+channel n on both ADC1 and ADC2. Channels 16 and 17 are internal (row 16).
+
+| Pin | Channel | Pin | Channel | Pin | Channel |
+|---|---|---|---|---|---|
+| PA0 | ADC12 IN0 | PB0 | ADC12 IN9 | PE7 | ADC3 IN1 |
+| PA1 | ADC12 IN1 | PB1 | ADC12 IN5 | PE8 | ADC3 IN2 |
+| PA2 | ADC12 IN14 | PC0 | ADC12 IN10 | PE9 | ADC3 IN3 |
+| PA3 | ADC12 IN15 | PC1 | ADC12 IN11 | PE10 | ADC3 IN4 |
+| PA4 | ADC12 IN18 | PC2 | ADC12 IN12 | PE11 | ADC3 IN5 |
+| PA5 | ADC12 IN19 | PC3 | ADC12 IN13 | PE12 | ADC3 IN6 |
+| PA6 | ADC12 IN3 | PC4 | ADC12 IN4 | PE13 | ADC3 IN7 |
+| PA7 | ADC12 IN7 | PC5 | ADC12 IN8 | PE14 | ADC3 IN8 |
+| PF11 | ADC1 IN2 | PF13 | ADC2 IN2 | PE15 | ADC3 IN9 |
+| PF12 | ADC1 IN6 | PF14 | ADC2 IN6 | PB2 | ADC3 IN0 |
+
+Package matters: not every pin exists on every package, and the table does not
+check that.
+
 ## 6. Implementation order
 
 1. `mm_signal_sample_mv` and the duplicate-pin check in `src/signal.c`, with unit tests.
@@ -169,18 +190,10 @@ Running the production image is the final HAL compatibility check.
 - Continuous + DMA, with GPDMA peripheral requests (separate PR).
 - Timer-triggered conversion (`EXTSEL`/`EXTEN`), injected group, analog watchdogs, oversampling, the asynchronous kernel clock.
 - Internal channels (VREFINT, temperature sensor, VBAT) with their calibration values.
+- Differential inputs (`DIFSEL`, `ADCALDIF`).
 - Save/load and reverse stepping of ADC state.
 - STM32U5/L5 ADC.
 
-## 9. To confirm from ST documents before implementing
+## 9. Still to check
 
-RM0517 Rev 1 answered the register-level questions: instances, addresses,
-IRQs, clock enables, `ADRDY` after `ADDIS`, `SMPPLUS`, alignment and the `OFRx`
-layout. The rest needs the STM32H5F4 datasheet:
-
-- The (instance, channel) → pin table.
-- t_CAL and t_STAB.
-- The maximum f_ADC. RM0517 gives 5 Msps at 12 bit, which with 15 clocks per conversion implies about 75 MHz.
-
-To check in the CMSIS device header: whether ADC3's common registers are named
-`ADC3_COMMON` at 0x4202 DB00.
+- In the CMSIS device header: that ADC3's common registers sit at 0x4202 DB00, as the RM0517 layout implies.
