@@ -1,196 +1,94 @@
-# m33mu — External Signal Injection Design: ADC (Phase 2)
+# m33mu — External Signal Injection Design: ADC
 
-Status: **design in progress — needs more work before implementation
-starts.** Not agreed to the same level as the GPIO phase.
-Depends on: [signal-injection-gpio.md](signal-injection-gpio.md) (Phase 1) — this phase builds on
-top of the shared `signal.c` core, container format, and master-trigger
-mechanism established there, and doesn't change their shape. Read that doc
-first; this one only covers what's ADC-specific or still unresolved.
-Target: STM32H5F4 profile (`cpu/stm32h5f4/`), same as Phase 1.
-Scope: model a voltage-vs-time trace consumable by an ADC channel
-(`stm32_adc.c`, new module), sharing the same firmware-defined time origin
-and container format as GPIO bindings, so a single trace can drive an ADC
-and a GPIO pin simultaneously from one capture.
+Status: **design agreed, not implemented.**
+Depends on: [signal-injection-gpio.md](signal-injection-gpio.md). This phase
+reuses the `.sigc` container, `--signal-bind`, `--signal-sync` and the replay
+clock of `src/signal.c` without changing them. Read that doc first; this one
+only covers what is ADC-specific.
+
+Scope: a new shared ADC model, `cpu/stm32_adc.c`, that converts the voltage of
+an injected pin into a digital code on the same time axis as GPIO injection.
+One capture can drive GPIO pins and ADC inputs at the same time.
 
 ---
 
-## 1. Decisions made so far (ADC-specific)
+## 1. Decisions
 
-| # | Question | Decision | Rationale |
+| # | Topic | Decision | Rationale |
 |---|---|---|---|
-| 12 | ADC conversion trigger model | Start with **software single-conversion** (`CR.ADSTART` → delay → `ISR.EOC` → `DR`), then **continuous mode** (`CFGR.CONT`) as a trivial extension, then **timer-triggered** (`EXTSEL`/`EXTEN`) later, reusing the same tick hook | Covers the majority of firmware ADC usage first; timer-trigger needs no new time source, just a new caller of the same tick |
-| 18 | ADC reference voltage | **Separate global CLI flag (`--adc-vref-mv`)**, defaults to `--vdd-mv` if omitted, but independently overridable — never assumed equal to `VDD` | On STM32H5, ADC full-scale is set by `VREF+`, which sits on a distinct supply chain (`VDD` → possibly-independent `VDDA` → possibly-independent `VREF+`) — `VREF+` can be external, sourced from the internal `VREFBUF` (configurable ~1.8V/~2.048V/~2.5V), or bonded straight to `VDDA` depending on package. Defaulting to `VDD` matches the common case (smaller packages, `VREF+` tied to `VDDA` tied to `VDD`) without hardcoding it |
+| 1 | First target | **STM32H5F4** (RM0517). H563/H533 (RM0481) follow on the same `cpu/stm32_adc.c`, with per-SoC glue for base addresses, IRQ numbers and the pin-to-channel table | H5F4 is what the production firmware runs on. The ADC IP is the same across the H5 family, so the shared model carries over |
+| 2 | Conversion modes | **Software start, polled**, then **EOC/EOS interrupts**, then **continuous mode** (`CFGR.CONT`). **Continuous + DMA is a separate PR** | These cover the production firmware. DMA needs GPDMA peripheral requests (`REQSEL`, one beat per request, circular mode), which `cpu/stm32_gpdma.c` lacks today: it copies the whole block as soon as a channel is enabled. That work also benefits other peripherals |
+| 3 | Channels | **Regular scan sequence**: `SQR1.L` + 1 conversions, channels from `SQR1..SQR4`, `EOC` after each, `EOS` after the last | The production firmware scans several channels. The injected group (`JSQR`, `JADSTART`) is out of scope |
+| 4 | Calibration and ready | **Fixed delays.** Writing `ADCAL` starts a calibration that clears `ADCAL` after t_CAL ADC clocks. Writing `ADEN` sets `ISR.ADRDY` after t_STAB ADC clocks. Take both values from the H5F4 datasheet before implementing. `DEEPPWD` and `ADVREGEN` are stored but not checked | HAL polls `ADCAL` and `ADRDY`, so without them it spins forever. Fixed delays keep HAL timeouts and start-up timing realistic. The regulator start-up wait in HAL is a software delay, so it needs no model |
+| 5 | ADC clock | **HCLK synchronous only**: `ADC_CCR.CKMODE` = HCLK/1, /2 or /4, derived from the existing CPU clock. `CKMODE = 00` (asynchronous kernel clock) prints a one-time "unsupported" warning and falls back to HCLK/1. `RCC_CCIPR5.ADCDACSEL` and `ADC_CCR.PRESC` are not modelled | The production firmware uses the synchronous clock. With 1 instruction = 1 cycle, HCLK/n gives an exact integer ratio to CPU cycles |
+| 6 | Conversion timing | Each channel is **sampled at the start of its slot**. `EOC` follows after the `SMPRx` sampling time plus the resolution time (12.5 / 10.5 / 8.5 / 6.5 ADC clocks for 12/10/8/6 bit). Time is counted in half ADC clocks so the .5 values stay integer. In continuous mode the next sequence starts immediately | Deterministic, and close enough to silicon for IRQ timing and software that depends on sample rate. An instant conversion would make continuous mode a busy loop |
+| 7 | Quantizer | `code = clamp(round(mV · (2^res − 1) / vref_mv), 0, 2^res − 1)`, with `res` from `CFGR.RES`, then `OFFSETx` subtraction and `CFGR.ALIGN`. Out-of-range input **saturates**, it never wraps | Matches real ADC behaviour. Ideal by default, so tests can assert exact codes |
+| 8 | Noise | Off by default. **`--adc-noise-lsb=<n>`** adds uniform ±n LSB noise before the clamp, from a PRNG seeded by **`--adc-seed=<s>`** (default 0). No offset or gain error model | Lets you test robustness against noise while keeping every run reproducible |
+| 9 | Reference voltage | **`--adc-vref-mv`**. Defaults to `--vdd-mv` if omitted, independently overridable | On H5, full scale is `VREF+`, which can be external, from `VREFBUF`, or bonded to `VDDA`. Defaulting to `VDD` covers the common case without hardcoding it |
+| 10 | Binding | **By pin**: `--signal-bind:trace=ain0:target=PA0`, with no new role. The pin's ADC channel comes from a per-SoC table taken from the datasheet. One trace can be bound to several pins | Firmware and schematics name pins, not channels. A single pad voltage feeds both the digital input and the ADC |
+| 11 | Pin mode | The ADC sees the injected voltage only when the pin's `MODER` is analog (`11`). An unbound channel, or a pin not in analog mode, converts as 0 mV. An analog pin reads 0 in `IDR`, as on silicon | Matches the hardware, and catches firmware that forgets to put the pin in analog mode |
+| 12 | Sampling API | New `mm_signal_sample_mv(bank, pin, t_cycles)` returns the zero-order-hold value of the trace bound to that pin at `t_cycles`. Before the trigger fires it returns the trace's first sample | The ADC pulls a value at slot start, while GPIO keeps its precomputed crossings. Both use the same replay clock |
+| 13 | `full_scale_mv` | **Metadata only.** The emulator never reads it; quantization uses `--adc-vref-mv` alone. The format section of the GPIO doc says so | It records the capture's range, not the emulated ADC's. Using it for scaling would tie the result to the recording instead of the board |
+| 14 | Trigger fragility | **Already handled** by `--signal-sync`: a sync PC that is never reached fails the run with exit code 1. Test firmware anchors on a `noinline` marker, not on a HAL entry point that LTO could inline | Same mechanism as GPIO |
+| 15 | Internal channels | **Out of scope**: VREFINT, temperature sensor and VBAT convert as 0 mV, and no `VREFINT_CAL`/`TS_CAL` values are provided | Not needed yet. Add them when firmware computes VDDA from VREFINT |
 
-Note on `full_scale_mv` vs. `--adc-vref-mv`: the container's per-trace
-`full_scale_mv` field (see the GPIO doc's container format) describes the *trace's own recorded
-voltage range* (how the sample data was captured/scaled on disk), which is
-conceptually independent from `adc-vref-mv` (the *emulated ADC's*
-quantization reference). The intent is `stm32_adc.c` uses `adc-vref-mv`, not
-a trace's `full_scale_mv`, when converting a sampled millivolt value into a
-digital code — but see open item below, since nothing currently consumes
-`full_scale_mv` at all.
+## 2. Register model (`cpu/stm32_adc.c`)
 
-## 2. Open items / concerns raised in review — need resolution before build
+Per ADC instance:
 
-These came out of design review and aren't yet decided. Listed roughly in
-order of how much they'd block a first working `stm32_adc.c`.
+- `ISR`: `ADRDY`, `EOSMP`, `EOC`, `EOS`, `OVR`, write-1-to-clear.
+- `IER`: same bits; an enabled flag raises the instance's IRQ.
+- `CR`: `ADEN`, `ADDIS`, `ADSTART`, `ADSTP`, `ADCAL`, `ADVREGEN`, `DEEPPWD`.
+- `CFGR`: `RES`, `ALIGN`, `CONT`, `OVRMOD`. `EXTEN`/`EXTSEL`, `DMAEN`, `DISCEN` and `AUTDLY` are stored but ignored.
+- `SMPR1`/`SMPR2`, `SQR1..SQR4`, `OFFSET1..4`, `DR`.
+- Common: `ADC_CCR.CKMODE`.
 
-### 2.1 `ADRDY`/calibration are missing from the register model — likely blocking
+Overrun: if `EOC` is still set when the next conversion ends, `OVR` is set.
+With `OVRMOD = 0` `DR` keeps the old value; with `OVRMOD = 1` it is overwritten.
+Reading `DR` clears `EOC`.
 
-The current sketch of the register model (§4 below) only covers `CR`
-(`ADEN`, `ADSTART`), `CFGR` (`CONT`), `ISR`/`IER` (`EOC`), `DR`, `SQR1`.
-There's no `ADRDY` and no `ADCAL`.
+The model implements the `mmio_bus` `peek`, `save` and `load` hooks, like the
+other stateful peripherals.
 
-On real H5 silicon — and inside `HAL_ADC_Start()` — the sequence is:
-calibrate (`ADCAL`) → set `ADEN` → **poll `ISR.ADRDY`** → then `ADSTART`. If
-`ADRDY` is never modeled/set, any HAL-based test firmware will spin forever
-before ever reaching the signal-injection path, and the ADC phase's tests
-(§5 below) simply won't run against realistic firmware.
-
-Needs a decision — even a deliberately simple one, e.g. "`ADCAL` is a no-op
-that completes instantly, `ADRDY` sets itself the instruction after `ADEN`
-is written" — but it needs to be an explicit line in this doc, not an
-implicit gap.
-
-### 2.2 No clamping/saturation rule for the ADC quantizer
-
-"Quantize sampled mV against `adc-vref-mv`" (decision #12, and the
-implementation trace below) needs an explicit formula, and, more
-importantly, explicit behavior for out-of-range input — a trace sample above
-`adc-vref-mv` or below 0 mV. Real ADCs saturate at `0x000`/`0xFFF` (for
-12-bit); they don't wrap or produce undefined codes. This should be a stated
-rule (`code = clamp(round(v_mv / vref_mv * 4095), 0, 4095)`, or similar) so
-the implementer isn't guessing.
-
-### 2.3 `full_scale_mv`'s actual role is unclear
-
-As noted above, the container format defines `full_scale_mv` per trace, and
-the design narrative distinguishes it from `adc-vref-mv`, but no code shown
-anywhere — sample lookup, GPIO threshold logic, or the sketch of the ADC
-quantization path — actually reads it. Before implementing `stm32_adc.c`'s
-quantization step, decide: is this field pure provenance metadata from the
-HDF5 conversion (and therefore fine to leave unused by the emulator), or is
-it supposed to affect scaling in some way that hasn't been written down yet?
-If it's metadata-only, say so explicitly in the format doc so it's not
-mistaken for a wiring bug later.
-
-### 2.4 Trigger-symbol fragility against inlining/LTO
-
-Shared concern with the master-trigger mechanism from the GPIO phase, but
-worth re-flagging here because ADC test firmware is more likely to anchor
-the trigger on a HAL entry point (`HAL_ADC_Start`) than GPIO firmware is. If
-that symbol gets inlined into its caller under a release/LTO build, `nm`
-either won't find it or will resolve the wrong address, and the trigger
-silently never fires — meaning ADC bindings sit at `elapsed_ns` uninitialized
-and the test reads whatever the pre-trigger state happens to be, which could
-pass or fail for the wrong reason. Recommend test firmware use a dedicated
-`__attribute__((noinline))` marker function reached right before/after the
-real HAL call, and add a diagnostic for "master trigger configured but never
-fired" so this doesn't fail silently.
-
-### 2.5 H5F4 as the first ADC target — worth a sentence of justification
-
-STM32H5E4/H5F4 (covered by RM0517, confirmed distinct from RM0481's
-H523/533/H562/563/573 family) is one of the newer, more feature-dense H5
-variants — graphics/crypto-oriented, with Chrom-ART, JPEG, LTDC, and the PLAY
-peripheral alongside the ADC. That's fine if it's simply what the existing
-fleet/CI already targets, but if the near-term goal is specifically to shake
-out a correct ADC register model, a simpler H5 variant already covered by
-`cpu/stm32_*` (e.g. one under RM0481) might have been lower-friction to
-prototype against first, with H5F4-specific wiring (real base addresses,
-`ADC1_2_IRQn`) layered on after the model itself is validated. Worth a line
-on why H5F4 specifically is the first ADC target, if it's not just "that's
-the existing repo's primary profile."
-
-## 3. Runtime architecture (ADC leg)
-
-Adds one more consumer of
-`signal.c`'s `mm_signal_sample(binding_id)`:
+## 3. Runtime architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│ src/signal.c  (built in Phase 1, unchanged here)                     │
-└───────────┬───────────────────────────────────────────────────────┘
-            │ mm_signal_sample(binding_id)
-            ▼
-┌────────────────────────┐
-│ cpu/stm32_adc.c         │
-│ on ADSTART: quantize    │
-│ sampled mV into DR,     │
-│ set EOC, optional IRQ   │
-└────────────────────────┘
+src/signal.c  ── mm_signal_sample_mv(bank, pin, t) ──►  cpu/stm32_adc.c
+   (replay clock, ZOH lookup)                           slot start: sample, quantize
+                                                        slot end:   DR, EOC/EOS, IRQ
 ```
 
-`include/m33mu/signal.h`'s existing surface (`mm_signal_bind`,
-`mm_signal_sample`, `mm_signal_set_trigger`) is reused as-is; the only
-addition needed there is the ADC reference-voltage setter:
+The ADC advances through a tick hook next to `mm_timer_tick` at every time site
+in `main.c`, so it keeps running across WFI fast-forward and the TB fast path.
+A pending conversion deadline is cached so the hook costs one comparison when
+nothing is converting.
 
-```c
-void mm_signal_set_adc_vref_mv(mm_i32 vref_mv);     /* defaults to vdd_mv if never called */
-```
+## 4. Implementation order
 
-## 4. Implementation trace (suggested order, ADC phase)
+1. `mm_signal_sample_mv` in `src/signal.c`, with unit tests (before trigger, ZOH, explicit timebase).
+2. `cpu/stm32_adc.c/.h`: register model, calibration/ready delays, single software conversion, polled. `tests/stm32_adc_test.c` for the state machine and quantizer.
+3. H5F4 glue: base addresses, `ADC_CCR`, IRQ number and pin-to-channel table from RM0517 and the datasheet; MMIO registration; `adc_init`/`adc_reset`/`adc_tick` in `mm_target_cfg`.
+4. CLI: `--adc-vref-mv`, `--adc-noise-lsb`, `--adc-seed`; `docs/cli-usage.md`, `m33mu.1`.
+5. Scan sequence, `EOC`/`EOS`/`OVR` interrupts, continuous mode.
+6. H563/H533 glue.
 
-Picks up after the GPIO phase's item 5 (first end-to-end GPIO test passing).
+## 5. Testing
 
-6. **`cpu/stm32_adc.h` / `cpu/stm32_adc.c`** (new shared module, mirrors
-   `cpu/stm32_timers.h`/`.c`)
-   - Register model: `CR` (`ADEN`, `ADSTART`), `CFGR` (`CONT`), `ISR`/`IER`
-     (`EOC`), `DR`, `SQR1` — **plus `ADRDY`/`ADCAL` per open item 2.1 above,
-     to be resolved before writing this**.
-   - On `ADSTART`: `mm_signal_sample(binding)` → quantize against
-     `adc-vref-mv` (not a trace's own `full_scale_mv` — see open item 2.3)
-     → clamp per open item 2.2 → `DR`, set `EOC`, optional NVIC IRQ.
-   - `stm32_adc_soc` struct for per-chip RCC/IRQ config (same shape as
-     `stm32_timers_soc`).
+Host unit tests: quantizer (resolutions, saturation, offset, alignment, seeded
+noise), conversion and calibration timing in CPU cycles for each `CKMODE`,
+scan order and flags, overrun, pin-mode check.
 
-7. **`cpu/stm32h5f4/stm32h5f4_adc.c/.h`** (new, mirrors
-   `stm32h5f4_timers.c`) — per-chip glue: real ADC1/ADC2 base addresses
-   (confirm from RM0517 memory map — STM32H5E4/H5F4/H5E5/H5F5 reference
-   manual, not RM0481 which covers the H523/533/543/553/562/563/573 family)
-   and RCC/NVIC wiring.
+Firmware tests on H5F4, each anchored on a `--signal-sync` marker:
 
-8. **`cpu/stm32h5f4/stm32h5f4_mmio.c`** — register the ADC1/ADC2 MMIO
-   region (currently entirely unmapped, unlike LPC55S69's stubbed `ADC0`).
+- `adc-single`: a ramp sampled by polled single conversions; codes checked within ±1 LSB of the expected value.
+- `adc-scan-irq`: three channels on different traces, read in the EOC interrupt; checks order and values.
+- `adc-continuous`: conversion rate matches `SMPR` and `CKMODE`.
+- `gpio-adc-shared-trace`: one trace bound to two pins, one analog and one digital, read back to back; both reflect the same instant.
+- Negative: pin not in analog mode converts 0.
 
-9. **`include/m33mu/target.h`** — add `adc_init`/`adc_reset`/`adc_tick`
-   function pointers to `mm_target_cfg`, same shape as the existing
-   `timer_*` triple; wire STM32H5F4's `mm_target_cfg` instance to the new
-   `stm32h5f4_adc.c` functions.
+## 6. Deferred
 
-10. **Tests** — `tests/stm32_adc_test.c` (register-level conversion state
-    machine, following the `stm32_timers_test.c` harness pattern), and the
-    firmware integration tests in §5 below.
-
-## 5. Testing (ADC phase — deferred until the register model lands)
-
-- `gpio-adc-shared-trace` — one trace bound to both an ADC channel and a
-  GPIO pin; firmware reads `ADC1->DR` and the GPIO `IDR`
-  back-to-back and both should reflect the same instant of the same
-  physical signal. Validates the GPIO doc's shared-timebase decision (shared timebase
-  across peripheral types) end-to-end, but depends on the ADC register
-  model above being implemented first — not buildable until then.
-- Additional ADC-only test firmware (single-conversion value accuracy,
-  continuous-mode re-triggering, EOC/IRQ timing) still needs to be scoped
-  once the register model (§4 items 6-9) and the open items in §2 are
-  resolved — not detailed yet, unlike the GPIO phase's test matrix.
-
-## 6. Other deferred items (not blocking, not yet scheduled)
-
-- **Timer-triggered ADC conversion** (`EXTSEL`/`EXTEN`) — deferred until
-  software-single-conversion and continuous mode are working (see decision
-  #12).
-- **Confirm real STM32H5F4 ADC1/ADC2 base addresses and `ADC1_2_IRQn`
-  number** from **RM0517** (STM32H5E4/H5F4 and H5E5/H5F5 reference manual —
-  m33mu's own `cpu/stm32h5_mmio.c` already cites RM0517 for H5F4's AHB2ENR
-  bit layout, so this is the correct manual, not RM0481) before writing
-  `stm32h5f4_adc.h`.
-- **GPDMA `TRIGSEL`/EXTI trigger gating** — real STM32H5 silicon lets an
-  EXTI-sourced GPIO edge gate a GPDMA memory-to-memory transfer;
-  `cpu/stm32_gpdma.c` currently starts a channel immediately on `CxCR.EN`
-  and doesn't model trigger sources at all. Independent, non-trivial work on
-  the GPDMA model itself — only worth building if test firmware specifically
-  exercises triggered-GPDMA+EXTI+GPIO capture. (Also noted in the GPIO doc,
-  since the trigger source is a GPIO/EXTI event even though the gated
-  peripheral is DMA, not ADC — listed here too since it's squarely
-  "needs-more-work" territory.)
+- Continuous + DMA, with GPDMA peripheral requests (separate PR).
+- Timer-triggered conversion (`EXTSEL`/`EXTEN`), injected group, watchdogs, oversampling, the asynchronous kernel clock.
+- Internal channels (VREFINT, temperature sensor, VBAT) with their calibration values.
+- STM32U5/L5 ADC.

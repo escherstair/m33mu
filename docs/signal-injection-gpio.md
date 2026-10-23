@@ -61,8 +61,9 @@ trace     u32 id; char name[32]; u32 timebase_id; i32 full_scale_mv
 All timebases come first, then all traces. Each trace references a timebase
 by id. Traces that share a timebase are sample-aligned, as in a simultaneous
 multi-channel capture. `period_ns != 0` is a uniform timebase, and
-`period_ns == 0` means explicit timestamps. `full_scale_mv` is not used by
-GPIO bindings.
+`period_ns == 0` means explicit timestamps. `full_scale_mv` is metadata
+recording the capture's range. The emulator never reads it, and ADC conversion
+scales against `--adc-vref-mv`.
 
 The loader accepts only `version == 1`. It rejects duplicate timebase ids,
 duplicate trace ids or names, explicit timestamps that go backwards, a file
