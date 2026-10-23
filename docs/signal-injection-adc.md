@@ -1,7 +1,8 @@
 # m33mu — External Signal Injection Design: ADC
 
-Status: **design agreed, not implemented.** Values marked *(confirm)* come
-from ST documents that have not been checked yet; §9 lists them.
+Status: **design agreed, not implemented.** Register-level facts are checked
+against RM0517 Rev 1. Values marked *(confirm)* need the STM32H5F4 datasheet;
+§9 lists them.
 Depends on: [signal-injection-gpio.md](signal-injection-gpio.md). This phase
 reuses the `.sigc` container, `--signal-bind`, `--signal-sync` and the replay
 clock of `src/signal.c` without changing their shape. Read that doc first; this
@@ -22,11 +23,11 @@ or taking an error path.
 | # | Topic | Decision | Rationale |
 |---|---|---|---|
 | 1 | First target | **STM32H5F4** (RM0517). H563/H533 (RM0481) follow on the same `cpu/stm32_adc.c`, with per-SoC glue for base addresses, IRQ numbers and the channel table | H5F4 is what the production firmware runs on. The ADC IP is the same across the H5 family |
-| 2 | Instances | Map **every ADC instance the part has** (ADC1, and ADC2 if RM0517 lists it *(confirm)*), all with the full model and one shared common block | HAL reads the other instance's `CR` when it decides whether it may write `CCR`. An unmapped instance faults |
+| 2 | Instances | Map **all three ADCs**, all with the full model. ADC1 (master) and ADC2 (slave) share one block at 0x4202 8000: ADC1 at +0x000, ADC2 at +0x100, common registers at +0x300. ADC3 is independent, at 0x4202 D800 with the same layout and its own common registers. The secure aliases are at 0x5202 xxxx. IRQs: ADC1 37, ADC2 69, ADC3 149. Dual mode (`CCR.DUAL`) is stored but not modelled | HAL reads the other instance's `CR` when it decides whether it may write `CCR`. An unmapped instance faults |
 | 3 | Conversion modes | **Software start, polled**, then **EOC/EOS interrupts**, then **continuous mode** (`CFGR.CONT`). **Continuous + DMA is a separate PR** | These cover the production firmware. DMA needs GPDMA peripheral requests (`REQSEL`, one beat per request, circular mode), which `cpu/stm32_gpdma.c` lacks today |
 | 4 | Channels | **Regular scan sequence**: `SQR1.L` + 1 conversions, channels from `SQR1..SQR4`. The injected group is out of scope: `JADSTART` writes are ignored | The production firmware scans several channels |
-| 5 | Calibration and ready | **Fixed delays**: `ADCAL` clears after t_CAL ADC clocks, `ADRDY` sets t_STAB ADC clocks after `ADEN` *(confirm both)*. The full `CR` state machine is in §2.2 | HAL polls both flags with timeouts. Fixed delays keep start-up timing realistic |
-| 6 | ADC clock | **HCLK synchronous only**: `ADC_CCR.CKMODE` = 01/10/11 → HCLK/1, /2, /4. `CKMODE = 00` prints a one-time "unsupported" warning and runs as HCLK/1. A one-time warning also fires when f_ADC exceeds the datasheet maximum *(confirm)*. `RCC_CCIPR5.ADCDACSEL`, `CCR.PRESC` and the HPRE = 1 requirement of HCLK/1 are not modelled | The production firmware uses the synchronous clock, which gives an exact integer ratio to CPU cycles |
+| 5 | Calibration and ready | **Fixed delays**: `ADCAL` clears after t_CAL, and `ADRDY` sets t_STAB after `ADEN` *(confirm both)*. The full `CR` state machine is in §2.2 | HAL polls both flags with timeouts. Fixed delays keep start-up timing realistic |
+| 6 | ADC clock | **HCLK synchronous only**: `ADC_CCR.CKMODE` = 01/10/11 → HCLK/1, /2, /4. `CKMODE = 00` prints a one-time "unsupported" warning and runs as HCLK/1. A one-time warning also fires when f_ADC exceeds the datasheet maximum *(confirm)*. `RCC_CCIPR5.ADCDACSEL`, `CCR.PRESC` and the HPRE = 1 requirement of HCLK/1 (RM0517 §30.4.3) are not modelled | The production firmware uses the synchronous clock, which gives an exact integer ratio to CPU cycles |
 | 7 | Conversion timing | **Sampled at the end of the sampling time**, when `EOSMP` sets. `EOC` follows after the resolution time. §3 has the arithmetic | Matches silicon. With long sampling times, sampling at slot start would be about 10 µs early |
 | 8 | Quantizer | `code = clamp(round(mV · (2^res − 1) / vref_mv), 0, 2^res − 1)`, then the offset stage and alignment of §2.5. Out-of-range input **saturates**, it never wraps | Ideal by default, so tests assert exact codes |
 | 9 | Noise | Off by default. **`--adc-noise-lsb=<n>`** adds uniform ±n LSB before the clamp, from a PRNG seeded by **`--adc-seed=<s>`** (default 0). No offset or gain error model | Robustness tests that stay reproducible |
@@ -36,18 +37,21 @@ or taking an error path.
 | 13 | Sampling API | `mm_signal_sample_mv(bank, pin, cycles_ahead, &mv)`; §4 | The ADC pulls one value per conversion. GPIO keeps its precomputed crossings |
 | 14 | `full_scale_mv` | **Metadata only.** The emulator never reads it | It records the capture's range, not the emulated ADC's |
 | 15 | Trigger fragility | **Already handled** by `--signal-sync`: an unreached sync PC fails the run with exit code 1. Test firmware anchors on a `noinline` marker | Same mechanism as GPIO |
-| 16 | Internal channels | **Out of scope.** VREFINT, the temperature sensor and VBAT convert as 0 mV, and no calibration values are provided. The first conversion of an internal channel prints a **one-time warning** | Firmware that derives VDDA from VREFINT would divide by zero, which gives 0 on M33 without a fault. The warning makes that visible |
+| 16 | Internal channels | **Out of scope.** VREFINT, VSENSE (temperature), VBAT/4 and VDDCORE convert as 0 mV, and no calibration values are provided. The first conversion of an internal channel prints a **one-time warning**. RM0517 §30.4.4 places them at ADC1 IN17, ADC2 IN16/IN17 and ADC3 IN14–IN17; the per-SoC table marks them | Firmware that derives VDDA from VREFINT would divide by zero, which gives 0 on M33 without a fault. The warning makes that visible |
 | 17 | Snapshots | **Debugger reads must be side-effect free**: a `peek` of `DR` does not clear `EOC`. Save/load and reverse stepping are **deferred**, as for GPIO injection | `core_interfaces.c` falls back to `read` when there is no `peek`. The GPIO doc already defers replay-position snapshots |
-| 18 | Clock gating | While `RCC_AHB2ENR.ADCEN` is clear, register reads return 0, writes are ignored and the ADC does not advance | Same rule as `stm32_gpio.c` |
+| 18 | Clock gating | While the clock enable is clear (`RCC_AHB2ENR` bit 10 `ADCEN` for ADC1/2, bit 24 `ADC3EN` for ADC3), register reads return 0, writes are ignored and the ADC does not advance | Same rule as `stm32_gpio.c` |
 
 ## 2. Register model (`cpu/stm32_adc.c`)
 
 ### 2.1 Storage
 
-The whole instance block (offsets 0x000–0x0FF) and the common block (`CSR`,
-`CCR`, `CDR`) are backed by storage, so every register HAL writes reads back:
-`CFGR2`, `DIFSEL`, `CALFACT`, `TRx`, `AWDxCR`, every `CCR` field (`VREFEN`,
-`VSENSESEL`, `VBATEN`, `PRESC`, ...). Only the bits below have behaviour.
+Each instance's registers (offsets 0x000–0x0FC) and the common registers are
+backed by storage, so every register HAL writes reads back: `CFGR2` (0x10),
+`DIFSEL`, `CALFACT`, `TRx`, `AWDxCR`, `OR` (0xC8), and every `CCR` field
+(`VBATEN`, `TSEN`, `VREFEN`, `PRESC`, `CKMODE`, `MDMA`, `DMACFG`, `DELAY`, `DUAL`).
+Reset values follow RM0517 Table 303: `CR` = 0x2000 0000 (`DEEPPWD` set) and
+`CFGR` = 0x8000 0000 (`JQDIS` set). `CSR` is a read-only live mirror of the
+master and slave `ISR` bits. Only the bits below have behaviour.
 
 ### 2.2 `CR`
 
@@ -57,9 +61,9 @@ writes 0 to the others.
 
 | Bits | Behaviour |
 |---|---|
-| `ADVREGEN`, `DEEPPWD`, `ADCALDIF` | Plain read/write, not checked |
-| `ADEN` | Set-only; writing 0 is ignored. Accepted only when `ADCAL`, `ADSTART`, `JADSTART`, `ADSTP`, `JADSTP` and `ADDIS` are all 0. Sets `ISR.ADRDY` t_STAB later. Rewriting 1 while waiting does not restart the delay. Cleared only by `ADDIS` |
-| `ADDIS` | Set-only. Accepted only when `ADEN = 1` and no conversion is ongoing. Clears `ADEN` and `ADDIS` immediately. `ADRDY` is left for software to clear *(confirm)* |
+| `ADVREGEN`, `DEEPPWD`, `ADCALDIF` | Read/write, not checked. Writing `DEEPPWD = 1` also clears `ADVREGEN` |
+| `ADEN` | Set-only; writing 0 is ignored. Accepted only when `ADCAL`, `ADSTART`, `JADSTART`, `ADSTP`, `JADSTP` and `ADDIS` are all 0, and not during the 4 ADC clocks after `ADCAL` clears. Sets `ISR.ADRDY` t_STAB later. Rewriting 1 while waiting does not restart the delay. Cleared only by `ADDIS` |
+| `ADDIS` | Set-only. Accepted only when `ADEN = 1` and no conversion is ongoing. Clears `ADEN` and `ADDIS` immediately. `ADRDY` stays set; software clears it (RM0517 §30.4.9) |
 | `ADCAL` | Set-only. Accepted only when `ADEN = 0`. Cleared by hardware after t_CAL. `CALFACT` keeps its stored value |
 | `ADSTART` | Set-only. Accepted only when `ADEN = 1`, `ADDIS = 0` and `ADSTP = 0`. Starts the sequence. Cleared by hardware at `EOS` when `CONT = 0`, and when `ADSTP` completes |
 | `ADSTP` | Set-only. Accepted only when `ADSTART = 1`. Aborts the conversion in progress without updating `DR`, then clears `ADSTP` and `ADSTART` immediately |
@@ -74,22 +78,28 @@ writes 0 to the others.
 
 - `SMPR1`/`SMPR2` give each channel's sampling time. `SQR1..SQR4` give the order.
 - `CFGR` fields with behaviour: `RES`, `ALIGN`, `CONT`, `OVRMOD`. `EXTEN`/`EXTSEL`, `DMAEN`, `DMACFG`, `DISCEN` and `AUTDLY` are stored but ignored.
-- Overrun: `OVR` sets when a conversion ends while `EOC` is still set.
-  - With `OVRMOD = 0`, `DR` keeps the old value, the new result is discarded, and the sequence continues.
-  - With `OVRMOD = 1`, `DR` is overwritten.
+- Overrun (RM0517 §30.4.26): `DR` is backed by a three-stage FIFO.
+  - With `OVRMOD = 0`, results queue in the FIFO. Reading `DR` pops the oldest one. `EOC` stays set while the FIFO is not empty *(interpretation: the RM text is ambiguous here)*. A result that arrives with the FIFO full sets `OVR` and is discarded. The sequence continues.
+  - With `OVRMOD = 1`, the FIFO is off. Each result overwrites `DR`, and `OVR` sets when the previous result was unread.
 
 ### 2.5 Offset and alignment
 
-- Each `OFRx` has `OFFSET_EN`, `OFFSET_CH`, `OFFSETPOS`, `SATEN` and `OFFSET`. An enabled `OFRx` whose `OFFSET_CH` matches the converted channel applies to the result.
-  - `OFFSETPOS = 0` subtracts `OFFSET`, `OFFSETPOS = 1` adds it.
-  - With `SATEN = 1`, the result saturates to `[0, 2^res − 1]`. With `SATEN = 0`, it is signed and sign-extended in `DR`.
-- `ALIGN = 0` right-aligns the result. `ALIGN = 1` left-aligns it to 16 bits, except at 6-bit resolution, where the result is aligned to a byte *(confirm)*.
+- `OFR1..4` (0x60–0x6C) each have `OFFSET_EN` (31), `OFFSET_CH` (30:26), `SATEN` (25), `OFFSETPOS` (24) and `OFFSET` (11:0). An enabled `OFRx` whose `OFFSET_CH` matches the converted channel applies to the result.
+  - `OFFSET` is on the 12-bit scale at every resolution. At lower resolutions the result is `code − (OFFSET >> (12 − res))` (RM0517 Table 294). `OFFSETPOS = 1` adds instead of subtracting.
+  - With `SATEN = 1`, the result saturates to `[0, 2^res − 1]` and is unsigned. With `SATEN = 0`, it is signed.
+- Alignment and sign extension follow RM0517 Figures 270–273 exactly, and the unit tests take their expected bit patterns from those figures.
+  - `ALIGN = 0` right-aligns.
+  - `ALIGN = 1` left-aligns to the half-word, except at 6-bit resolution, which aligns to the byte.
+  - Signed results put the sign extension in the upper bits.
+- Oversampling (`ROVSE`, `JOVSE`) is out of scope. When it is enabled, RM0517 ignores `ALIGN` and the offsets; the model warns once and converts without oversampling.
 
 ## 3. Timing and clock
 
 - **ADC clock:** f_ADC = HCLK / {1, 2, 4} from `CKMODE`. All ADC delays count in half ADC clocks, then convert to CPU cycles: `cycles = half_clocks · ckdiv / 2`, rounded up.
-- **Sampling time:** `SMPx` ∈ {2.5, 6.5, 12.5, 24.5, 47.5, 92.5, 247.5, 640.5} ADC clocks. `SMPR1.SMPPLUS` replaces 2.5 with 3.5 *(confirm on H5F4)*.
-- **Resolution time:** 12.5 / 10.5 / 8.5 / 6.5 ADC clocks for 12/10/8/6 bit.
+- **Sampling time:** `SMPx` ∈ {2.5, 6.5, 12.5, 24.5, 47.5, 92.5, 247.5, 640.5} ADC clocks. `SMPR1.SMPPLUS` (bit 31) replaces 2.5 with 3.5 (RM0517 §30.4.12).
+  - RM0517 shifts the real sampling instant by 0.5 clock in scan and continuous mode without changing the total time. The model ignores that shift.
+  - `BULB` and `SMPTRIG` are stored but not modelled.
+- **Resolution time:** 12.5 / 10.5 / 8.5 / 6.5 ADC clocks for 12/10/8/6 bit (RM0517 Table 293).
 - **Each conversion slot:**
   1. The slot starts.
   2. After the sampling time, the pin is sampled and `EOSMP` sets.
@@ -164,11 +174,13 @@ Running the production image is the final HAL compatibility check.
 
 ## 9. To confirm from ST documents before implementing
 
-From RM0517 and the STM32H5F4 datasheet:
+RM0517 Rev 1 answered the register-level questions: instances, addresses,
+IRQs, clock enables, `ADRDY` after `ADDIS`, `SMPPLUS`, alignment and the `OFRx`
+layout. The rest needs the STM32H5F4 datasheet:
 
-- Number of ADC instances, base addresses, IRQ numbers, the `RCC_AHB2ENR.ADCEN` bit.
-- (instance, channel) → pin table.
-- t_CAL, t_STAB, the maximum f_ADC.
-- Whether `ADRDY` stays set after `ADDIS`.
-- `SMPPLUS` availability, and the 6-bit left-alignment rule.
-- The `OFRx` field layout.
+- The (instance, channel) → pin table.
+- t_CAL and t_STAB.
+- The maximum f_ADC. RM0517 gives 5 Msps at 12 bit, which with 15 clocks per conversion implies about 75 MHz.
+
+To check in the CMSIS device header: whether ADC3's common registers are named
+`ADC3_COMMON` at 0x4202 DB00.
